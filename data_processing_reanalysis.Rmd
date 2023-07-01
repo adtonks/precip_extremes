@@ -1,0 +1,22 @@
+---
+title: "Extreme Rainfall Data Processing"
+author: "Adam Tonks"
+date: "2022-09-16"
+output: pdf_document
+---
+
+```{r}
+precip <- read.csv("Data/p_conus_20c.csv", header=FALSE)
+lonlat <- read.csv("Data/lonlat_conus_20c.csv", header=FALSE)
+```
+
+```{r}
+library(zoo)
+k_cum_precip <- apply(precip, 2, rollsum, k=30)
+k_cum_precip <- rbind(matrix(0, nrow=30, ncol=ncol(k_cum_precip)), k_cum_precip[1:(nrow(k_cum_precip)-1), ])
+```
+
+```{r}
+write.table(k_cum_precip, "Data/cum_precip_reanalysis.csv", row.names=FALSE,
+            col.names=FALSE, sep=",")
+```

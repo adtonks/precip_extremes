@@ -1,0 +1,913 @@
+---
+title: "Extreme Rainfall"
+author: "Adam Tonks"
+output: pdf_document
+---
+
+\newpage
+# Set global variables
+
+## Set threshold percentiles and default optimization max iterations
+
+```{r}
+PRECIP_PERC <- 0.997
+CUM_PRECIP_PERC <- 0.95
+MAXIT <- 100
+```
+
+\newpage
+# Function definitions
+
+## Evaluate 2-D basis functions at each location in dataset
+
+```{r}
+eval_2d_basis <- function(n_knots_lon, n_knots_lat, n_order) {
+  basis_lon <- create.bspline.basis(
+    rangeval=range(lons),
+    breaks=seq(min(lons), max(lons),len=n_knots_lon),
+    norder=n_order
+    )
+  basis_lon_eval <- eval.basis(lons, basis_lon)
+  
+  basis_lat <- create.bspline.basis(
+    rangeval=range(lats),
+    breaks=seq(min(lats), max(lats), len=n_knots_lat),
+    norder=n_order
+    )
+  basis_lat_eval <- eval.basis(lats, basis_lat)
+  
+  # calculate the 2D basis at each location
+  basis_all_eval <- matrix(NA, length(lons),
+                           ncol(basis_lon_eval)*ncol(basis_lat_eval))
+  for(i in 1:length(lons)) {
+    basis_all_eval[i,] <- kronecker(basis_lon_eval[i,], basis_lat_eval[i,])
+  }
+  
+  basis_lon_names <- NULL
+  for(i in 1:ncol(basis_lon_eval)) {
+    basis_lon_names <- c(basis_lon_names, paste("B_", i-1, sep=""))
+  }
+  colnames(basis_lon_eval) <- basis_lon_names
+  
+  basis_lat_names <- NULL
+  for(i in 1:ncol(basis_lat_eval)) {
+    basis_lat_names <- c(basis_lat_names, paste("C_", i-1, sep=""))
+  }
+  colnames(basis_lat_eval) <- basis_lat_names
+  
+  colnames(basis_all_eval) <- paste(
+    rep(basis_lon_names, each=ncol(basis_lat_eval)),
+    rep(basis_lat_names, ncol(basis_lon_eval)), sep="x")
+  
+  return(list(lon=basis_lon_eval, lat=basis_lat_eval, all=basis_all_eval))
+}
+```
+
+\newpage
+## Define log-likelihood functions
+
+```{r}
+calc_kron_log_lik <- function(par, mat, target) {
+  est_intens <- mat%*%par
+  # check that values are not negative
+  if(sum(est_intens<0)>0) return(-1e9)
+  return(sum(dpois(as.vector(target), est_intens, log=TRUE)))
+}
+```
+
+\newpage
+## Compute design matrix
+
+```{r}
+calc_design_mat <- function(n_knots_lon, n_knots_lat, n_order) {
+  if(n_knots_lon==0 || n_knots_lat==0 || n_order==0) {
+    return(list(design_mat=X, basis_vals=NULL))
+  }
+  
+  # create design matrix - scaling done by setting parscale in optim function
+  basis_vals <- eval_2d_basis(n_knots_lon, n_knots_lat, n_order)$all
+  
+  # delete bases that are all 0s on study domain
+  delete_basis <- colSums(basis_vals==0)==nrow(basis_vals)
+  basis_vals <- basis_vals[, !delete_basis]
+  
+  basis_vals_full <- matrix(rep(basis_vals,
+                                each=length(unique(year))), nrow=nrow(X))
+  colnames(basis_vals_full) <- colnames(basis_vals)
+  
+  # for spatially-varying intercept
+  basis_vals_full_inter <- basis_vals_full
+  colnames(basis_vals_full_inter) <- paste0(colnames(basis_vals), "_inter")
+  
+  # multiply basis vals by year
+  design_mat <- cbind(X[, 1:3], basis_vals_full*X[, 4])
+  design_mat_aug <- cbind(X[, 1:3], basis_vals_full_inter, basis_vals_full*X[, 4])
+  
+  return(list(design_mat=design_mat, design_mat_aug=design_mat_aug, basis_vals=basis_vals))
+}
+```
+
+\newpage
+## Calculate starting point using linear regression
+
+```{r}
+fit_lm_mod <- function(target, n_knots_lon, n_knots_lat, n_order, spline_inter=FALSE) {
+  data_mats <- calc_design_mat(n_knots_lon, n_knots_lat, n_order)
+  if(spline_inter) {
+    design_mat <- data_mats$design_mat_aug
+  } else {
+    design_mat <- data_mats$design_mat
+  }
+  
+  lm_data_mat <- cbind.data.frame(Y=as.vector(target),
+                                  design_mat[, -1])
+  mod <- lm(Y~., data=lm_data_mat)
+  
+  mod$coefficients[is.na(mod$coefficients)] <- 0
+  
+  loglik <- calc_kron_log_lik(mod$coefficients, design_mat, target)
+  spat_coef <- data_mats$basis_vals%*%
+    mod$coefficients[(length(mod$coefficients)-ncol(data_mats$basis_vals)+1):length(mod$coefficients)]
+  
+  return(list(par=mod$coefficients, mod=mod, loglik=loglik,
+              basis_vals=data_mats$basis_vals,
+              design_mat=design_mat, spat_coef=spat_coef))
+}
+```
+
+\newpage
+## Calculate optimization starting point and scaling
+
+```{r}
+# starting point calculated w/ linear regression may be outside feasible region
+# add an offset to the intercept if this is the case
+correct_start_vals <- function(start_vals, n_knots_lon, n_knots_lat, n_order,
+                               target, spline_inter=FALSE) {
+  data_mats <- calc_design_mat(n_knots_lon, n_knots_lat, n_order)
+  if(spline_inter) {
+    design_mat <- data_mats$design_mat_aug
+  } else {
+    design_mat <- data_mats$design_mat
+  }
+  
+  if(calc_kron_log_lik(start_vals, design_mat, target)==-1e9) {
+    start_vals[1] <- start_vals[1] +
+      2*abs(min(design_mat%*%start_vals))
+  }
+  
+  return(start_vals)
+}
+
+calc_parscale <- function(start_vals, n_knots_lon, n_knots_lat, n_order,
+                          target, spline_inter=FALSE) {
+  data_mats <- calc_design_mat(n_knots_lon, n_knots_lat, n_order)
+  if(spline_inter) {
+    design_mat <- data_mats$design_mat_aug
+  } else {
+    design_mat <- data_mats$design_mat
+  }
+  
+  parscale <- NULL
+  
+  for(i in 1:length(start_vals)) {
+    new_par_lower <- start_vals
+    new_par_lower[i] <- new_par_lower[i]-0.5
+    new_par_upper <- start_vals
+    new_par_upper[i] <- new_par_upper[i]+0.5
+    
+    function_val_lower <- calc_kron_log_lik(new_par_lower,
+                                            design_mat, target)
+    function_val_upper <- calc_kron_log_lik(new_par_upper,
+                                            design_mat, target)
+    
+    # new_par_upper is guaranteed to be in the feasible region
+    # this is because all values in the design matrix are positive
+    
+    # if new par_lower not in feasible region, use a uni-directional window
+    if(function_val_lower==-1e9) {
+      new_par_lower <- start_vals
+      new_par_lower[i] <- new_par_lower[i]-0
+      new_par_upper <- start_vals
+      new_par_upper[i] <- new_par_upper[i]+1
+      
+      function_val_lower <- calc_kron_log_lik(new_par_lower,
+                                              design_mat, target)
+      function_val_upper <- calc_kron_log_lik(new_par_upper, 
+                                              design_mat, target)
+    }
+    
+    parscale <- c(parscale, 1/abs(function_val_upper - function_val_lower))
+  }
+  
+  return(parscale)
+}
+```
+
+\newpage
+## Functions for fitting null and Poisson models
+
+```{r}
+fit_mod <- function(fn, target, start_vals, n_knots_lon, n_knots_lat, n_order,
+                    parscale, maxit=MAXIT, trace=0, hessian=0, method="BFGS",
+                    spline_inter=FALSE) {
+  set.seed(123)
+  data_mats <- calc_design_mat(n_knots_lon, n_knots_lat, n_order)
+  if(spline_inter) {
+    design_mat <- data_mats$design_mat_aug
+  } else {
+    design_mat <- data_mats$design_mat
+  }
+  
+  optim_results <- optim(par=start_vals,
+                         fn=fn, mat=design_mat, target=target,
+                         method=method, control=list(trace=trace, fnscale=-1,
+                                                   maxit=maxit,
+                                                   parscale=parscale),
+                         hessian=hessian)
+  
+  if(hessian==FALSE) {
+    hessian <- NULL
+  } else {
+    hessian <- optim_results$hessian
+  }
+  
+  loglik <- fn(optim_results$par, design_mat, target)
+  
+  if(n_knots_lon==0 || n_knots_lat==0 || n_order==0) {
+    spat_coef <- NULL
+  } else {
+    spat_coef <- data_mats$basis_vals%*%
+      optim_results$par[(length(optim_results$par)-ncol(data_mats$basis_vals)+1)
+                        :length(optim_results$par)]
+  }
+  
+  return(list(par=optim_results$par, hessian=hessian, loglik=loglik,
+              basis_vals=data_mats$basis_vals,
+              design_mat=design_mat, spat_coef=spat_coef))
+}
+```
+
+\newpage
+## Calculate $p$-value against null model
+
+```{r}
+loglik_test_null <- function(loglik, loglik_null, n_knots_lon, n_knots_lat,
+                             n_order) {
+  n_bases_lon <- n_knots_lon+n_order-2
+  n_bases_lat <- n_knots_lat+n_order-2
+
+  test_stat <- -2*(loglik_null-loglik)
+  p_val <- pchisq(test_stat, df=n_bases_lon*n_bases_lon-1, lower.tail=FALSE)
+
+  return(p_val)
+}
+```
+
+\newpage
+## Plot data on map of CONUS
+
+```{r}
+plot_legend <- function(scale_min, scale_max, n_bins=10, scientific=FALSE, labels=NULL) {
+  if(is.null(labels)) {
+    bin_vals <- cut(c(scale_min, scale_max), breaks=n_bins, include.lowest=TRUE)
+    labels <- substr(levels(bin_vals), 2, nchar(levels(bin_vals))-1)
+    for(i in 1:length(levels(bin_vals))) {
+      label <- strsplit(labels[i], ",")[[1]]
+      label <- format(as.numeric(label), scientific=scientific)
+      labels[i] <- paste(label, collapse=",")
+    }
+  }
+  plot.new()
+  legend("topleft", labels, pch=15, col=rev(viridis(n_bins)))
+}
+
+plot_map_data <- function(vals, n_knots_lon=2, n_knots_lat=2,
+                          scale_min=min(vals), scale_max=max(vals), title="",
+                          n_bins=50, crosses=NULL, state_bounds=TRUE) {
+  
+  if(is.null(crosses)) {
+    crosses <- rep("#00000000", length(vals))
+  }
+  min_lon <- min(lonlat[, 1])
+  max_lon <- max(lonlat[, 1])
+  min_lat <- min(lonlat[, 2])
+  max_lat <- max(lonlat[, 2])
+  
+  plot_vals <- cbind.data.frame(lons=lons+min_lon, lats=lats+min_lat, vals)
+  
+  bin_vals <- cut(c(scale_min, scale_max, vals), breaks=n_bins, include.lowest=TRUE)
+  bin_vals <- as.numeric(bin_vals)[-(1:2)]
+  
+  # lines for illustrating knot locations
+  mydf <- data.frame(lat_1=c(seq(min_lat, max_lat, len=n_knots_lat),
+                             rep(min_lat, n_knots_lon)), 
+                     lon_1=c(rep(min_lon, n_knots_lat),
+                             seq(min_lon, max_lon, len=n_knots_lon)), 
+                     lat_2=c(seq(min_lat, max_lat, len=n_knots_lat),
+                             rep(max_lat, n_knots_lon)), 
+                     lon_2=c(rep(max_lon, n_knots_lat),
+                             seq(min_lon, max_lon, len=n_knots_lon)))
+  
+  world <- ne_countries(scale="medium", returnclass="sf")
+  
+  usa <- st_as_sf(maps::map("state", fill=TRUE, plot=FALSE))
+  
+  p <- ggplot() +
+    geom_point(data=plot_vals, aes(x=lons, y=lats), shape=15,
+               col=rev(viridis(n_bins))[bin_vals], size=3.95) +
+    geom_point(data=plot_vals, aes(x=lons, y=lats), shape=4,
+               col=crosses, size=1) +
+    xlab("Longitude") + ylab("Latitude") + ggtitle(title) +
+    geom_segment(data=mydf, aes(x=lon_1, y=lat_1, xend=lon_2, yend=lat_2), 
+               color="purple", size=0.4, alpha=0.5, linetype=2) +
+    geom_sf(data=st_geometry(world), color="black", fill="transparent") +
+    coord_sf(xlim=c(-130, -65), ylim=c(23, 50), expand=FALSE)
+  
+    if(state_bounds) {
+    p <- p + geom_sf(data=st_geometry(usa),
+                     color=rgb(0, 0, 0, maxColorValue=255, alpha=95),
+                     fill="transparent", size=0.2) +
+      coord_sf(xlim=c(-130, -65), ylim=c(23, 50), expand=FALSE)
+  }
+  print(p)
+}
+```
+
+\newpage
+## Calculate exact Hessian
+```{r}
+calc_kron_hessian <- function(par, mat, target) {
+  const_terms <- -as.vector(target)*(mat%*%par)^(-2)
+  hess_exact <- matrix(NA, nrow=length(par), ncol=length(par))
+  for(i in 1:nrow(hess_exact)) {
+    for(j in 1:ncol(hess_exact)) {
+      hess_exact[i, j] <- sum(const_terms*mat[, i]*mat[, j])
+    }
+  }
+  return(hess_exact)
+}
+```
+
+The Hessian entry corresponding to $\beta_a$ and $\beta_b$ equals
+$$-k \sum_{i=1}^n x_{i, a}x_{i, b} \lambda_i^{-2}$$
+
+\newpage
+## Calculate parameter and spatially-varying coefficient confidence intervals
+
+```{r}
+calc_signif <- function(fn, par, n_knots_lon, n_knots_lat, n_order, target,
+                        alpha=0.05) {
+  data_mats <- calc_design_mat(n_knots_lon, n_knots_lat, n_order)
+  
+  # use numDeriv package hessian function instead of base R hessian function 
+  # hessian <- numDeriv::hessian(fn, par, mat=data_mats$design_mat,
+  # target=target)
+  
+  hessian <- calc_kron_hessian(par, data_mats$design_mat, target)
+  # hessian is sometimes not invertible so use approach detailed at
+  # generalized i and
+  # https://gking.harvard.edu/files/gking/files/numhess.pdf
+  # if hessian is invertible, this method yields same results
+  H_pseudo_inv <- ginv(-hessian)
+  chols_mat <- gchol(H_pseudo_inv)
+  D <- diag(diag(chols_mat))
+  L <- as.matrix(chols_mat)
+  par_cov_mat <- L%*%D%*%t(L)
+  
+  # set negative std errs to 0 and raise warning if necessary
+  par_std_errs <- sqrt(pmax(0, diag(par_cov_mat)))
+  if(sum(par_std_errs==0)>0) {
+    warning("NA standard errors for parameters set to 0 ", immediate.=TRUE)
+  }
+  
+  z_vals <- par/par_std_errs
+  p_vals <- 2*pnorm(-abs(z_vals))
+  par_lower <- par - qnorm(1-alpha/2)*par_std_errs
+  par_upper <- par + qnorm(1-alpha/2)*par_std_errs
+  signif <- !((par_lower<0) & (0<par_upper))
+  par_signif_table <- data.frame(value=par, p_vals=p_vals,
+                                 upper=par_upper, lower=par_lower,
+                                 signif=signif)
+  
+  if(n_knots_lon==0 || n_knots_lat==0 || n_order==0) {
+   return(list(par_cov_mat=par_cov_mat, par_signif_table=par_signif_table,
+               coef_cov_mat=NULL, coef_lower=NULL, coef_upper=NULL,
+               hessian=hessian))
+  }
+  
+  coef_cov_mat <- data_mats$basis_vals%*%par_cov_mat[-(1:3), -(1:3)]%*%
+    t(data_mats$basis_vals)
+  
+  # set negative std errs to 0 and raise warning if necessary
+  coef_std_errs <- sqrt(pmax(0, diag(coef_cov_mat)))
+  if(sum(coef_std_errs==0)>0) {
+    warning("NA standard errors for coefficients set to 0 ", immediate.=TRUE)
+  }
+  spat_coef <- data_mats$basis_vals%*%par[-(1:3)]
+  coef_lower <- spat_coef - qnorm(1-alpha/2)*coef_std_errs
+  coef_upper <- spat_coef + qnorm(1-alpha/2)*coef_std_errs
+  
+#   coef_z_vals <- spat_coef/coef_std_errs
+#   coef_p_vals <- 2*pnorm(-abs(Z))
+  MSE <- mean((as.vector(data_mats$design_mat%*%par)-target)^2)
+  
+  return(list(par_cov_mat=par_cov_mat, par_signif_table=par_signif_table,
+              coef_cov_mat=coef_cov_mat, coef_lower=coef_lower,
+              coef_upper=coef_upper, hessian=hessian, MSE=MSE))
+}
+```
+
+We use a method to calculate a pseudoinverse matrix in the case that the Hessian is not invertible due to numerical issues. In the case that it is invertible, our covariance matrix $\Sigma$ equals $(-H)^{-1}$.
+
+Let $A$ be a matrix of basis function covariate values. Let $\Sigma'$ be the covaraiance matrix for the respective coefficients. Then the covariances are along the diagonal of $A\Sigma't(A)$.
+
+\newpage
+# Load packages
+
+## Load packages
+
+```{r}
+library(fda)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(viridisLite)
+library(bdsmatrix)
+library(MASS)
+library(numDeriv)
+```
+
+\newpage
+# Data processing
+
+## Generate point datasets
+
+```{r}
+lonlat <- read.csv("Data/lonlat_conus_20c.csv", header=FALSE)
+lons <- lonlat[, 1]-min(lonlat[, 1])
+lats <- lonlat[, 2]-min(lonlat[, 2])
+n_loc <- nrow(lonlat)
+precip <- read.csv("Data/p_conus_20c.csv", header=FALSE)
+cum_precip <- read.csv("Data/cum_precip_reanalysis.csv", header=FALSE)
+
+# subset data to 1950 to 2015
+precip <- precip[41639:65744, ]
+cum_precip <- cum_precip[41639:65744, ]
+
+date <- seq(as.Date("1950-01-01"), as.Date("2015-12-31"), by="days")
+n_days <- nrow(precip)
+year <- as.numeric(format(date, "%Y"))
+year_uniq <- seq(1950, 2015)
+n_year <- length(year_uniq)
+```
+
+```{r}
+precip_thresh_vec <- apply(precip, 2, quantile, probs=PRECIP_PERC)
+precip_thresh_mat <- matrix(rep(precip_thresh_vec, n_days), nrow=n_days,
+                            byrow=TRUE)
+
+# alternate code for calculating thresholds using only days with non-zero rainfall
+# precip_thresh_vec <- rep(NA, ncol(precip))
+# for(i in 1:ncol(precip)) {
+#  precip_thresh_vec[i] <- quantile(precip[precip[ , i]!=0, i], probs=PRECIP_PERC)
+# }
+
+cum_precip_thresh_vec <- apply(cum_precip, 2, quantile, probs=CUM_PRECIP_PERC)
+cum_precip_thresh_mat <- matrix(rep(cum_precip_thresh_vec, n_days), nrow=n_days,
+                                byrow=TRUE)
+
+precip_pts <- precip>=precip_thresh_mat
+cum_precip_pts <- cum_precip>=cum_precip_thresh_mat
+flood_pts <- precip_pts & cum_precip_pts
+
+# aggregate by year to smooth out seasonal trend
+comp_precip_pts <- NULL
+for(y in year_uniq) {
+  comp_precip_pts <- rbind(comp_precip_pts, colSums(precip_pts[year==y, ]))
+}
+
+comp_cum_precip_pts <- NULL
+for(y in year_uniq) {
+  comp_cum_precip_pts <- rbind(comp_cum_precip_pts,
+                               colSums(cum_precip_pts[year==y, ]))
+}
+
+comp_flood_pts <- NULL
+for(y in year_uniq) {
+  comp_flood_pts <- rbind(comp_flood_pts, colSums(flood_pts[year==y, ]))
+}
+
+X <- cbind(rep(1, length(comp_flood_pts)), rep(lons, each=n_year),
+           rep(lats, each=n_year), rep(year_uniq, ncol(comp_flood_pts))-1950)
+colnames(X) <- c("intercept", "lon", "lat", "year")
+```
+
+## Verify that loaded data appears reasonable
+
+```{r}
+0.003*365
+mean(comp_precip_pts)
+plot_map_data(colMeans(comp_precip_pts))
+plot_legend(scale_min=min(colMeans(comp_precip_pts)),
+            scale_max=max(colMeans(comp_precip_pts)))
+
+0.05*365
+mean(comp_cum_precip_pts)
+plot_map_data(colMeans(comp_cum_precip_pts))
+plot_legend(scale_min=min(colMeans(comp_cum_precip_pts)),
+            scale_max=max(colMeans(comp_cum_precip_pts)))
+
+0.003*0.05*365
+mean(comp_flood_pts)
+plot_map_data(colMeans(comp_flood_pts))
+plot_legend(scale_min=min(colMeans(comp_flood_pts)),
+            scale_max=max(colMeans(comp_flood_pts)))
+```
+
+The mean counts for extreme precipitation and heavy preceding precipitation at each location is near what we would expect based on the percentile values for thresholding. There is also no spatial trend, since the thresholds are location-specific.
+
+There is a spatial trend for flood risk, since some areas are more likely to see extreme precipitation and heavy preceding precipitation occurring simultaneously.
+
+## Check for linear trends in data
+
+```{r}
+year_uniq_0 <- year_uniq-1950
+
+precip_data <- cbind.data.frame(counts=rowMeans(comp_precip_pts),
+                                year=year_uniq_0)
+
+ggplot(precip_data, aes(x=year, y=counts)) + 
+  geom_point(color='#2980B9', size = 4) + 
+  geom_smooth(method=lm, color='#2C3E50')
+
+cum_precip_data <- cbind.data.frame(counts=rowMeans(comp_cum_precip_pts),
+                                    year=year_uniq_0)
+
+ggplot(cum_precip_data, aes(x=year, y=counts)) + 
+  geom_point(color='#2980B9', size = 4) + 
+  geom_smooth(method=lm, color='#2C3E50')
+
+flood_data <- cbind.data.frame(counts=rowMeans(comp_flood_pts),
+                               year=year_uniq_0)
+
+ggplot(flood_data, aes(x=year, y=counts)) + 
+  geom_point(color='#2980B9', size = 4) + 
+  geom_smooth(method=lm, color='#2C3E50')
+```
+
+Here we simply regress our point counts aggregated over CONUS against year. The results are in line with those in the literature.
+
+\newpage
+# Check basis functions appear reasonable using cubic splines with $4$ longitude and $3$ latitude knots
+
+## $1$-D basis functions
+
+```{r}
+n_knots_lon <- 5
+n_knots_lat <- 4
+n_order <- 4
+
+n_bases_lon <- n_knots_lon+n_order-2
+n_bases_lat <- n_knots_lat+n_order-2
+bases_lon_indices <- 0:(n_bases_lon-1)
+bases_lat_indices <- 0:(n_bases_lat-1)
+
+bases_check <- eval_2d_basis(n_knots_lon=n_knots_lon, n_knots_lat=n_knots_lat,
+                             n_order=n_order)
+
+# check longitude basis functions look reasonable
+for(i in bases_lon_indices) {
+plot(lons[lats==41-min(lonlat[, 2])],
+     bases_check$lon[lats==41-min(lonlat[, 2]), i+1], type='l',
+     main=paste("Lon. basis function B_", i, sep=""),
+     xlab="longitude", ylab="value", ylim=c(0, 1))
+}
+# truncation is due to not all lons being available for lat=41 (see map)
+
+# check latitude basis functions look reasonable
+for(i in bases_lat_indices) {
+plot(lats[lons==-101-min(lonlat[, 1])],
+     bases_check$lat[lons==-101-min(lonlat[, 1]), i+1], type='l',
+     main=paste("Lat. basis function C_", i, sep=""),
+     xlab="latitude", ylab="value", ylim=c(0, 1))
+}
+
+# truncation is due to not all lats being available for lon=-101 (see map)
+```
+
+## $2$-D basis functions
+
+```{r, fig.height=2, fig.width=3.5}
+# plot basis functions to check that they appear reasonable
+for(i in bases_lon_indices) {
+  for(j in bases_lat_indices) {
+    plot_map_data(bases_check$all[, n_bases_lat*i+j+1], scale_min=0,
+                  scale_max=1, n_knots_lon, n_knots_lat,
+                  title=colnames(bases_check$all)[n_bases_lat*i+j+1],
+                  state_bounds=FALSE)
+  }
+}
+```
+
+```{r, fig.height=3, fig.width=2.5}
+plot_legend(scale_min=0, scale_max=1, n_bins=10,
+            labels=c("0.0, 0.1", "0.1, 0.2", "0.2, 0.3", "0.3, 0.4", "0.4, 0.5",
+                     "0.5, 0.6", "0.6, 0.7", "0.7, 0.8", "0.8, 0.9", "0.9, 1.0"))
+```
+
+## Zero values in basis functions
+
+```{r}
+colSums(bases_check$all!=0)
+```
+
+Why are there virtually no non-zero values at any location for the $2$-D basis function $D_{6, 0}$, the product of basis functions $B_6$ and $C_0$? Note that $B_6$ and $C_0$ are non-zero only at large and small values for longitude and latitude, respectively. This corresponds to the SE-most region. There is almost no data within this region, so we don't evaluate the basis functions in this region. Hence we may have to remove similar splines when model fitting with a large number of knots (this is performed in the $\mathrm{calc\_design\_mat}$ function).
+
+\newpage
+# Calculate null model log likelihood values
+
+## Extreme precipitation
+
+```{r}
+# choose starting values in feasible region
+target <- comp_precip_pts
+start_vals <- c(mean(target), 0, 0, 0)
+parscale <- calc_parscale(start_vals, 0, 0, 0, target)
+no_spat_coef_mod_results <- fit_mod(fn=calc_kron_log_lik, target=target,
+                                    start_vals=start_vals, n_knots_lon=0,
+                                    n_knots_lat=0, n_order=0, parscale=parscale)
+loglik_null_precip <- no_spat_coef_mod_results$loglik
+```
+
+## Flood risk
+
+```{r}
+# choose starting values in feasible region
+target <- comp_flood_pts
+start_vals <- c(mean(target), 0, 0, 0)
+parscale <- calc_parscale(start_vals, 0, 0, 0, target)
+no_spat_coef_mod_results <- fit_mod(fn=calc_kron_log_lik, target=target,
+                                    start_vals=start_vals, n_knots_lon=0,
+                                    n_knots_lat=0, n_order=0, parscale=parscale)
+loglik_null_flood <- no_spat_coef_mod_results$loglik
+```
+
+\newpage
+# Plots for paper
+
+## Fit model for extreme precipitation
+
+```{r}
+target <- comp_precip_pts
+loglik_null <- loglik_null_precip
+n_knots_lon <- 6
+n_knots_lat <- 4
+n_order <- 4
+
+lm_mod <- fit_lm_mod(target, n_knots_lon, n_knots_lat, n_order)
+start_vals <- correct_start_vals(lm_mod$par, n_knots_lon, n_knots_lat, n_order,
+                                 target)
+parscale <- calc_parscale(start_vals, n_knots_lon, n_knots_lat, n_order, target)
+mod <- fit_mod(calc_kron_log_lik, target, start_vals, n_knots_lon, n_knots_lat,
+               n_order, parscale)
+
+inter_vals <- mod$par
+inter_parscale <- calc_parscale(inter_vals, n_knots_lon, n_knots_lat, n_order,
+                                target)
+mod <- fit_mod(calc_kron_log_lik, target, inter_vals, n_knots_lon, n_knots_lat,
+               n_order, inter_parscale)
+p_val <- loglik_test_null(mod$loglik, loglik_null, n_knots_lon, n_knots_lat,
+                          n_order)
+signif_info_precip <- calc_signif(calc_kron_log_lik, mod$par, n_knots_lon, n_knots_lat,
+                           n_order, comp_precip_pts)
+print(p_val)
+```
+
+## Historic relative change
+
+```{r, fig.height=2, fig.width=3.5}
+lambda_precip_2015 <- mod$design_mat[X[, 4]==0, ]%*%mod$par+
+  mod$spat_coef*(2015 - 1950)
+lambda_precip_1950 <- mod$design_mat[X[, 4]==0, ]%*%mod$par+
+  mod$spat_coef*(1950 - 1950)
+
+perc_diff_precip <- ((lambda_precip_2015-lambda_precip_1950)/lambda_precip_1950)*100
+scale_min_precip <- -25
+scale_max_precip <- 225
+perc_diff_precip <- pmax(perc_diff_precip, scale_min_precip)
+perc_diff_precip <- pmin(perc_diff_precip, scale_max_precip)
+
+crosses_precip <- rep("#00000000", length(signif_info_precip$coef_lower))
+crosses_precip[(signif_info_precip$coef_lower<=0) & (0<=signif_info_precip$coef_upper)] <- "red"
+
+plot_map_data(perc_diff_precip, n_knots_lon, n_knots_lat, scale_min_precip, scale_max_precip, crosses=crosses_precip)
+```
+
+\newpage
+## Fit model for flood risk
+
+```{r}
+target <- comp_flood_pts
+loglik_null <- loglik_null_flood
+
+lm_mod <- fit_lm_mod(target, n_knots_lon, n_knots_lat, n_order)
+start_vals <- correct_start_vals(lm_mod$par, n_knots_lon, n_knots_lat, n_order,
+                                 target)
+parscale <- calc_parscale(start_vals, n_knots_lon, n_knots_lat, n_order, target)
+mod <- fit_mod(calc_kron_log_lik, target, start_vals, n_knots_lon, n_knots_lat,
+               n_order, parscale)
+
+inter_vals <- mod$par
+inter_parscale <- calc_parscale(inter_vals, n_knots_lon, n_knots_lat, n_order,
+                                target)
+mod <- fit_mod(calc_kron_log_lik, target, inter_vals, n_knots_lon, n_knots_lat,
+               n_order, inter_parscale)
+p_val <- loglik_test_null(mod$loglik, loglik_null, n_knots_lon, n_knots_lat,
+                          n_order)
+signif_info <- calc_signif(calc_kron_log_lik, mod$par, n_knots_lon, n_knots_lat,
+                           n_order, comp_flood_pts)
+print(p_val)
+```
+
+## Compare parameter significances with those found using linear regression model
+
+```{r}
+# this evidences the correctness of our significance computations
+summary(lm_mod$mod)
+signif_info$par_signif_table
+```
+
+## Spatially-varying coefficient estimates and confidence interval bounds on same color scale
+
+```{r, fig.height=2, fig.width=3.5}
+# set lower bounds less than 0 to NA
+# this means grid blocks with non-significant coefficient are not plotted
+coef_lower <- signif_info$coef_lower
+coef_upper <- signif_info$coef_upper
+
+crosses <- rep("#00000000", length(signif_info$coef_lower))
+crosses[(signif_info$coef_lower<=0) & (0<=signif_info$coef_upper)] <- "red"
+
+plot_map_data(mod$spat_coef, n_knots_lon, n_knots_lat,
+              scale_min=min(coef_lower), scale_max=max(coef_upper),
+              crosses=crosses)
+plot_map_data(coef_lower, n_knots_lon, n_knots_lat, scale_min=min(coef_lower),
+              scale_max=max(coef_upper))
+plot_map_data(coef_upper, n_knots_lon, n_knots_lat,
+              scale_min=min(coef_lower), scale_max=max(coef_upper))
+```
+
+```{r, fig.height=3, fig.width=2.5}
+plot_legend(scale_min=min(coef_lower)*1000, scale_max=max(coef_upper)*1000,
+            n_bins=10, labels=c("-2.82, -1.70", "-1.70, -0.59", "-0.59, 0.53",
+                                "0.53, 1.64", "1.64, 2.75", "2.75, 3.86",
+                                "3.86, 4.97", "4.97, 6.09", "6.09, 7.20",
+                                "7.20, 8.32"))
+```
+
+## Historic relative change
+
+```{r, fig.height=2, fig.width=3.5}
+lambda_2015 <- mod$design_mat[X[, 4]==0, ]%*%mod$par+mod$spat_coef*(2015 - 1950)
+lambda_1950 <- mod$design_mat[X[, 4]==0, ]%*%mod$par+mod$spat_coef*(1950 - 1950)
+
+perc_diff <- ((lambda_2015-lambda_1950)/lambda_1950)*100
+
+scale_min <- -25
+scale_max <- 225
+perc_diff <- pmax(perc_diff, scale_min)
+perc_diff <- pmin(perc_diff, scale_max)
+
+plot_map_data(perc_diff, n_knots_lon, n_knots_lat, scale_min, scale_max, crosses=crosses)
+```
+
+```{r, fig.height=3, fig.width=2.5}
+plot_legend(scale_min=min(perc_diff), scale_max=max(perc_diff), n_bins=10,
+            labels=c("-75, 0", "0, 25", "25, 50", "50, 75", "75, 100",
+                     "100, 125", "125, 150", "150, 175", "175, 200", ">200"))
+```
+
+## Future projections
+
+```{r, fig.height=2, fig.width=3.5}
+lambda_2015 <- mod$design_mat[X[, 4]==0, ]%*%mod$par+mod$spat_coef*(2015 - 1950)
+lambda_2030 <- mod$design_mat[X[, 4]==0, ]%*%mod$par+mod$spat_coef*(2030 - 1950)
+lambda_2045 <- mod$design_mat[X[, 4]==0, ]%*%mod$par+mod$spat_coef*(2045 - 1950)
+
+scale_min <- min(c(lambda_2015, lambda_2030, lambda_2045))
+scale_max <- max(c(lambda_2015, lambda_2030, lambda_2045))
+
+plot_map_data(lambda_2015, n_knots_lon, n_knots_lat, scale_min=scale_min, scale_max=scale_max)
+plot_map_data(lambda_2030, n_knots_lon, n_knots_lat, scale_min=scale_min, scale_max=scale_max)
+plot_map_data(lambda_2045, n_knots_lon, n_knots_lat, scale_min=scale_min, scale_max=scale_max)
+```
+
+```{r, fig.height=3, fig.width=2.5}
+plot_legend(scale_min=10*scale_min, scale_max=10*scale_max, n_bins=10,
+            labels=c("0.04, 0.77", "0.77, 1.49", "1.49, 2.21", "2.21, 2.94",
+                     "2.94, 3.66", "3.66, 4.38", "4.38, 5.10", "5.10, 5.82",
+                     "5.82, 6.54", "6.54, 7.27"))
+```
+
+## Future relative change
+
+```{r, fig.height=2, fig.width=3.5}
+perc_diff <- ((lambda_2045-lambda_2015)/lambda_2015)*100
+
+scale_min <- -5
+scale_max <- 45
+
+perc_diff <- pmax(perc_diff, scale_min)
+perc_diff <- pmin(perc_diff, scale_max)
+
+plot_map_data(perc_diff, n_knots_lon, n_knots_lat, scale_min=scale_min,
+              scale_max=scale_max, crosses=crosses)
+```
+
+```{r, fig.height=3, fig.width=2.5}
+plot_legend(scale_min=min(perc_diff), scale_max=max(perc_diff), n_bins=10,
+            labels=c("-90, 0", "0, 5", "5, 10", "10, 15", "15, 20", "20, 25",
+                     "25, 30", "30, 35", "35, 40", ">40"))
+```
+
+## Variances for future projection estimates
+
+```{r, fig.height=2, fig.width=3.5}
+design_mat_2030 <- mod$design_mat[X[, 4]==1, ]
+design_mat_2030[-(1:3)] <- design_mat_2030[-(1:3)]*(2030-1950)
+lambda_cov_mat <- design_mat_2030%*%signif_info$par_cov_mat%*%t(design_mat_2030)
+
+# set negative std errs to 0 and raise warning if necessary
+lambda_std_errs <- sqrt(pmax(0, diag(lambda_cov_mat)))
+if(sum(lambda_std_errs==0)>0) {
+  warning("NA standard errors for coefficients set to 0 ", immediate.=TRUE)
+}
+alpha <- 0.05
+pred_std_errs <- sqrt(lambda_std_errs^2+signif_info$MSE)
+
+plot_map_data(pred_std_errs, n_knots_lon, n_knots_lat,
+              scale_min=0.5, scale_max=1, state_bounds=FALSE)
+```
+
+```{r, fig.height=2, fig.width=3.5}
+design_mat_2045 <- mod$design_mat[X[, 4]==1, ]
+design_mat_2045[-(1:3)] <- design_mat_2045[-(1:3)]*(2045-1950)
+lambda_cov_mat <- design_mat_2045%*%signif_info$par_cov_mat%*%t(design_mat_2045)
+
+# set negative std errs to 0 and raise warning if necessary
+lambda_std_errs <- sqrt(pmax(0, diag(lambda_cov_mat)))
+if(sum(lambda_std_errs==0)>0) {
+  warning("NA standard errors for coefficients set to 0 ", immediate.=TRUE)
+}
+alpha <- 0.05
+pred_std_errs <- sqrt(lambda_std_errs^2+signif_info$MSE)
+
+plot_map_data(pred_std_errs, n_knots_lon, n_knots_lat,
+              scale_min=0.5, scale_max=1, state_bounds=FALSE)
+```
+
+```{r, fig.height=3, fig.width=2.5}
+plot_legend(scale_min=.5, scale_max=1, n_bins=10,
+            labels=c("5.0, 5.5", "5.5, 6.0", "6.0, 6.5", "6.5, 7.0",
+                    "7.0, 7.5", "7.5, 8.0", "8.0, 8.5", "8.5, 9.0",
+                    "9.0, 9.5", "9.5, 10.0"))
+```
+
+\newpage
+# Show that results are robust to number of splines used
+
+## Flood risk counts
+
+```{r}
+target <- comp_flood_pts
+n_order <- 4
+knots_mat <- matrix(c(2, 2,
+                      3, 2,
+                      4, 3,
+                      5, 3,
+                      6, 4,
+                      7, 4,
+                      10, 5), ncol=2, byrow=TRUE)
+
+for(i in 1:nrow(knots_mat)) {
+  n_knots_lon <- knots_mat[i, 1]
+  n_knots_lat <- knots_mat[i, 2]
+  
+  lm_mod <- fit_lm_mod(target, n_knots_lon, n_knots_lat, n_order)
+  start_vals <- correct_start_vals(lm_mod$par, n_knots_lon, n_knots_lat,
+                                   n_order, target)
+  parscale <- calc_parscale(start_vals, n_knots_lon, n_knots_lat, n_order,
+                            target)
+  mod <- fit_mod(calc_kron_log_lik, target, start_vals, n_knots_lon,
+                 n_knots_lat, n_order, parscale)
+  
+  inter_vals <- mod$par
+  inter_parscale <- calc_parscale(inter_vals, n_knots_lon, n_knots_lat, n_order,
+                                  target)
+  mod <- fit_mod(calc_kron_log_lik, target, inter_vals, n_knots_lon,
+                 n_knots_lat, n_order, inter_parscale, method="BFGS")
+  
+  plot_map_data(mod$spat_coef, n_knots_lon, n_knots_lat, min(mod$spat_coef),
+                max(mod$spat_coef))
+}
+```
