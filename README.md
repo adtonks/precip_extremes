@@ -1,4 +1,4 @@
-Code for the paper _Assessment of spatiotemporal flood risk due to compound precipitation extremes across the contiguous United States_. A preprint will be available soon.
+Code in R for the paper _Assessment of spatiotemporal flood risk due to compound precipitation extremes across the contiguous United States_. A preprint will be available soon.
 
 This code can also be modified to fit arbitrary 2-D spline-based spatiotemporal models.
 
